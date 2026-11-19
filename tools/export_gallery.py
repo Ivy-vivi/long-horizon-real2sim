@@ -21,6 +21,7 @@ from PIL import Image, ImageOps, ImageDraw
 
 BASE = Path(__file__).resolve().parents[1]
 LIMIT = 10
+EXCLUDED_VIEWS = json.loads((BASE / 'tools' / 'view_exclusions.json').read_text())
 
 
 def read(path, default=None):
@@ -36,6 +37,10 @@ def save(path, value):
 
 
 def uniform_indices(length, count=LIMIT):
+    if count <= 0:
+        return []
+    if count == 1:
+        return [length // 2] if length else []
     if length <= count:
         return list(range(length))
     return [round(i * (length - 1) / (count - 1)) for i in range(count)]
@@ -106,12 +111,38 @@ def camera_poses(root, kind, scene, images, files):
     return poses
 
 
+def is_scene_view(image):
+    """Admit full-frame comparison series, never use closeups as a fallback.
+
+    The source catalog recursively includes details/, focused/, local/, etc.
+    Those are inspection crops rather than additional camera viewpoints.
+    Archived zican comparisons numbered 100001+ are also enlarged crops.
+    """
+    if image.get('id') in EXCLUDED_VIEWS:
+        return False
+    relative = image['name'].split(' · ', 1)[-1].replace('\\', '/')
+    parts = Path(relative).parts
+    for folder in parts[:-1]:
+        if not (re.fullmatch(r'round_\d+(?:_authorized_\d+)?', folder)
+                or re.fullmatch(r'manual_[0-9a-f-]+', folder)
+                or folder in ('多尺度对照', '对比图', '对照图')):
+            return False
+    match = re.fullmatch(r'(comparison|view|ref)_(\d+)(?:_original_vs_updated)?\.(png|jpe?g|webp)', parts[-1], re.I)
+    return bool(match and 0 < int(match[2]) < 100000)
+
+
 def comparisons(images):
-    """Keep comparison panels, excluding nested render/detail duplicates."""
-    direct = [i for i in images if '/' not in i['name'].split(' · ', 1)[-1]]
-    candidates = direct or [i for i in images if re.search(r'(对照|对比)/', i['name'])]
-    panels = [i for i in candidates if re.search(r'(comparison_\d+|view_\d+|ref_\d+)', i['name'], re.I)]
-    return panels or candidates
+    # Some source scenes expose several archived rounds together. Keep the
+    # latest round so copies of one camera view do not consume the view budget.
+    def round_key(image):
+        for part in image['name'].split(' · ', 1)[-1].replace('\\', '/').split('/')[:-1]:
+            match = re.fullmatch(r'round_(\d+)(?:_authorized_(\d+))?', part)
+            if match:
+                return int(match[1]), int(match[2] or 0)
+        return None
+
+    latest = max((key for image in images if (key := round_key(image)) is not None), default=None)
+    return [image for image in images if round_key(image) in (None, latest) and is_scene_view(image)]
 
 
 def status_for(scene):
@@ -193,22 +224,23 @@ def build_scene(kind, scene, root, files, jobs):
                 row['images'].append({'label': f'室内视角 {n:02d} · 场景 / Shell', '_sources': pair})
         row['selection'] = 'paired'
     else:
-        if kind == 'zican':
-            images = comparisons(images)
-        # Explicit successful revisions on the original page remain visible.
+        # Apply the same full-scene gate to every collection BEFORE sampling.
+        images = comparisons(images)
+        row['scene_view_count'] = len(images)
+        # Retain scene-wide successful revisions, excluding reviewed closeups.
         revisions = [j for j in jobs if kind == 'scenes' and j.get('scene') == scene['id'] and j.get('status') == 'succeeded' and j.get('images') and j.get('kind', 'scene') == 'scene']
         revision = max(revisions, key=lambda j: j.get('created', 0)) if revisions else None
-        revised = revision.get('images', [])[:LIMIT] if revision else []
+        revised = comparisons(revision.get('images', []))[:LIMIT] if revision else []
         budget = LIMIT - len(revised)
         poses = camera_poses(root, kind, scene, images, files) if budget > 1 else None
         indices = (pose_selection(poses, budget) if poses and budget >= 2 else uniform_indices(len(images), budget) if budget >= 2 else [0] if budget and images else [])
-        row['selection'] = 'camera' if poses else 'sequence'
+        row['selection'] = 'scene_camera' if poses else 'scene_sequence'
         for i in indices:
             im = images[i]
             row['images'].append({'label': im['name'], 'source_index': i + 1, '_sources': [im]})
         for i, im in enumerate(revised):
             row['images'].append({'label': f'修订结果 · {i + 1:02d}', '_sources': [im]})
-        if revision:
+        if revised:
             row['version'] += ' · 含已完成修订'
     return row
 
